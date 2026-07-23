@@ -14,12 +14,25 @@ HEIGHT = 1080
 BASE_WIDTH = 900
 BASE_HEIGHT = 550
 
-PLAYER_W = 34
-PLAYER_H = 78
-GRAVITY = 0.9
-JUMP_FORCE = 24
-MOVE_SPEED = 8.5
+# Player collision box. Aspect (44:66 = 2:3) matches the 16x24 hero sprite so
+# it upscales without distortion.
+PLAYER_W = 44
+PLAYER_H = 66
 
+# --- Movement feel ("pixel man" mechanics) --------------------------------
+GRAVITY = 0.82
+MAX_FALL = 22.0
+JUMP_FORCE = 17.0
+JUMP_CUT = 0.45          # releasing jump early shortens the hop
+MOVE_SPEED = 7.6
+GROUND_ACCEL = 1.7       # how fast we reach MOVE_SPEED on the ground
+AIR_ACCEL = 0.95         # weaker steering in the air
+GROUND_FRICTION = 2.0    # deceleration when no key is held
+AIR_FRICTION = 0.35
+COYOTE_FRAMES = 6        # grace window to still jump just after leaving a ledge
+JUMP_BUFFER_FRAMES = 7   # remember a jump press made just before landing
+
+ASSET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 SAVE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "savegame.json")
 
 # ---------------------------------------------------------------------------
@@ -49,11 +62,19 @@ TEXT_MUTED = "#a8b3d6"
 TEXT_DIM = "#6d7699"
 BADGE_TEXT = "#0b1224"
 
-PLAYER_SKIN = "#f59e0b"
-PLAYER_SKIN_DARK = "#b45309"
-PLAYER_OUTLINE = "#fde68a"
-PARTICLE_COLOR = "#39407a"
+# platform styling (blocky pixel brick)
+BRICK_FILL = "#3b4675"
+BRICK_TOP = "#6b78ad"
+BRICK_SH = "#28305a"
+BRICK_MORTAR = "#232a52"
+CRUMBLE_FILL = "#7c4a12"
+CRUMBLE_TOP = "#b3752a"
+CRUMBLE_SH = "#4d2c08"
+
+OUTLINE_DARK = "#0f1120"
 SHADOW_COLOR = "#02030a"
+
+FONT = "Segoe UI"
 
 
 def lerp_color(c1, c2, t):
@@ -82,6 +103,65 @@ def save_progress(unlocked):
             json.dump({"unlocked": unlocked}, f)
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Asset manager: loads pixel-art PNGs and serves crisp nearest-neighbour
+# upscales, cached per integer zoom so redraws stay cheap.
+# ---------------------------------------------------------------------------
+
+class Assets:
+    def __init__(self, directory):
+        self.dir = directory
+        self.native = {}
+        self.flipped = {}
+        self.zoom_cache = {}
+        self.available = os.path.isdir(directory)
+        if self.available:
+            self._load_all()
+
+    def _load_all(self):
+        for fn in os.listdir(self.dir):
+            if fn.endswith(".png") and not fn.startswith("_"):
+                name = fn[:-4]
+                try:
+                    self.native[name] = tk.PhotoImage(file=os.path.join(self.dir, fn))
+                except Exception:
+                    pass
+        # Pre-mirror hero frames so we can face left.
+        for name in list(self.native):
+            if name.startswith("player_"):
+                self.flipped[name] = self._mirror(self.native[name])
+
+    @staticmethod
+    def _mirror(img):
+        w, h = img.width(), img.height()
+        out = tk.PhotoImage(width=w, height=h)
+        for y in range(h):
+            for x in range(w):
+                if not img.transparency_get(x, y):
+                    r, g, b = img.get(x, y)
+                    out.put(f"#{r:02x}{g:02x}{b:02x}", to=(w - 1 - x, y, w - x, y + 1))
+        return out
+
+    def get(self, name, zoom, flip=False):
+        zoom = max(1, int(zoom))
+        key = (name, zoom, flip)
+        cached = self.zoom_cache.get(key)
+        if cached is not None:
+            return cached
+        base = (self.flipped if flip else self.native).get(name)
+        if base is None:
+            base = self.native.get(name)
+        if base is None:
+            return None
+        img = base.zoom(zoom) if zoom > 1 else base
+        self.zoom_cache[key] = img
+        return img
+
+    def native_size(self, name):
+        img = self.native.get(name)
+        return (img.width(), img.height()) if img else (16, 16)
 
 
 # ---------------------------------------------------------------------------
@@ -355,32 +435,38 @@ class DevilishPlatformer:
 
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
-        pos_x = max(0, (screen_w - WIDTH) // 2)
-        pos_y = max(0, (screen_h - HEIGHT) // 2)
-        self.root.geometry(f"{WIDTH}x{HEIGHT}+{pos_x}+{pos_y}")
+        win_w = min(WIDTH, screen_w - 80)
+        win_h = min(HEIGHT, screen_h - 120)
+        pos_x = max(0, (screen_w - win_w) // 2)
+        pos_y = max(0, (screen_h - win_h) // 2)
+        self.root.geometry(f"{win_w}x{win_h}+{pos_x}+{pos_y}")
 
-        self.canvas = tk.Canvas(self.root, width=WIDTH, height=HEIGHT, bg="#03040c", highlightthickness=0)
+        self.canvas = tk.Canvas(self.root, width=win_w, height=win_h, bg="#03040c", highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
+
+        self.assets = Assets(ASSET_DIR)
 
         self.keys = {"left": False, "right": False, "jump": False}
         self.root.bind("<KeyPress>", self.on_key_press)
         self.root.bind("<KeyRelease>", self.on_key_release)
         self.canvas.bind("<Button-1>", self.on_click)
+        self.canvas.bind("<Motion>", self.on_motion)
         self.canvas.bind("<Configure>", self.on_resize)
 
         self.LEVELS = LEVEL_DEFS
-        self.select_cols = 3
 
         self.state = "menu"
-        self.player_x = 100
-        self.player_y = 200
-        self.vx = 0
-        self.vy = 0
+        self.player_x = 100.0
+        self.player_y = 200.0
+        self.vx = 0.0
+        self.vy = 0.0
         self.on_ground = False
         self.facing = 1
-        self.score = 0
+        self.coyote = 0
+        self.jump_buffer = 0
         self.deaths = 0
         self.frame_count = 0
+        self.anim_timer = 0
 
         self.platforms = []
         self.hazards = []
@@ -392,34 +478,44 @@ class DevilishPlatformer:
 
         self.current_level_index = 0
         self.select_index = 0
+        self.menu_index = 0
+        self.pause_index = 0
+        self.show_controls = False
         self.lose_reason = ""
         self.unlocked = load_progress(len(self.LEVELS))
+
+        # menu button hit-boxes for the current screen (logical rects + action)
+        self.buttons = []
+        self.hover_key = None
 
         self._scale = 1.0
         self._ox = 0.0
         self._oy = 0.0
-        self._cw = WIDTH
-        self._ch = HEIGHT
+        self._cw = win_w
+        self._ch = win_h
         self._gradient_cache = {}
+        self._img_refs = []
 
-        self.particles = [
+        self.stars = [
             {
                 "x": random.uniform(0, WIDTH),
                 "y": random.uniform(0, HEIGHT),
-                "r": random.uniform(2, 5),
-                "vx": random.uniform(-0.15, 0.15),
-                "vy": random.uniform(0.05, 0.25),
+                "s": random.randint(0, 2),
+                "vx": random.uniform(-0.12, 0.12),
+                "vy": random.uniform(0.04, 0.22),
+                "tw": random.uniform(0, math.tau),
             }
-            for _ in range(28)
+            for _ in range(46)
         ]
 
+        self.map_nodes = self._build_map_nodes()
+
         self.root.update_idletasks()
-        self.draw_menu()
-        self.root.after(50, self.ambient_tick)
+        self.render_current()
+        self.root.after(33, self.ambient_tick)
         self.root.mainloop()
 
-    # -- view transform (lets the logical WIDTH x HEIGHT playfield scale to
-    #    whatever size the window actually is, letterboxed to keep aspect) --
+    # -- view transform -------------------------------------------------
 
     def update_transform(self):
         cw = max(1, self.canvas.winfo_width())
@@ -486,6 +582,22 @@ class DevilishPlatformer:
             kw["font"] = (font[0], size) + tuple(font[2:])
         return self.canvas.create_text(px, py, **kw)
 
+    def blit(self, name, lx, ly, logical_h, anchor="center", flip=False):
+        """Draw a pixel-art sprite so it occupies `logical_h` logical px tall,
+        crisply nearest-neighbour upscaled for the current view scale."""
+        _nw, nh = self.assets.native_size(name)
+        if nh == 0:
+            return
+        target_screen_h = logical_h * self._scale
+        zoom = max(1, round(target_screen_h / nh))
+        img = self.assets.get(name, zoom, flip=flip)
+        if img is None:
+            return
+        px, py = self.L(lx, ly)
+        item = self.canvas.create_image(px, py, image=img, anchor=anchor)
+        self._img_refs.append(img)
+        return item
+
     def to_logical(self, ex, ey):
         self.update_transform()
         return (ex - self._ox) / self._scale, (ey - self._oy) / self._scale
@@ -516,26 +628,26 @@ class DevilishPlatformer:
         self._bg_ref = img
         self.canvas.create_image(0, 0, anchor="nw", image=img)
 
-    def draw_particles(self):
-        for p in self.particles:
-            r = p["r"]
-            self.oval(p["x"] - r, p["y"] - r, p["x"] + r, p["y"] + r, fill=PARTICLE_COLOR, outline="")
+    def draw_stars(self):
+        for s in self.stars:
+            twinkle = 0.5 + 0.5 * math.sin(s["tw"] + self.frame_count * 0.06)
+            if twinkle > 0.35:
+                self.blit(f"star_{s['s']}", s["x"], s["y"], 10 + s["s"] * 3)
 
     def ambient_tick(self):
-        if self.state in ("menu", "select"):
-            for p in self.particles:
-                p["x"] += p["vx"]
-                p["y"] += p["vy"]
-                if p["x"] < -10:
-                    p["x"] = WIDTH + 10
-                if p["x"] > WIDTH + 10:
-                    p["x"] = -10
-                if p["y"] < -10:
-                    p["y"] = HEIGHT + 10
-                if p["y"] > HEIGHT + 10:
-                    p["y"] = -10
+        self.frame_count += 1
+        if self.state in ("menu", "map"):
+            for s in self.stars:
+                s["x"] += s["vx"]
+                s["y"] += s["vy"]
+                if s["x"] < -12:
+                    s["x"] = WIDTH + 12
+                if s["x"] > WIDTH + 12:
+                    s["x"] = -12
+                if s["y"] > HEIGHT + 12:
+                    s["y"] = -12
             self.render_current()
-        self.root.after(50, self.ambient_tick)
+        self.root.after(33, self.ambient_tick)
 
     # -- input -------------------------------------------------------
 
@@ -545,8 +657,8 @@ class DevilishPlatformer:
     def render_current(self):
         if self.state == "menu":
             self.draw_menu()
-        elif self.state == "select":
-            self.draw_select()
+        elif self.state == "map":
+            self.draw_map()
         else:
             self.draw_frame()
 
@@ -558,33 +670,20 @@ class DevilishPlatformer:
             self.keys["right"] = True
         elif key in ("up", "w", "space"):
             self.keys["jump"] = True
+            if self.state == "playing":
+                self.jump_buffer = JUMP_BUFFER_FRAMES
 
         if self.state == "menu":
-            if key in ("return", "space", "up", "w"):
-                self.state = "select"
-                self.draw_select()
-        elif self.state == "select":
-            self.handle_select_key(key)
+            self.handle_menu_key(key)
+        elif self.state == "map":
+            self.handle_map_key(key)
         elif self.state == "playing":
-            if key == "escape":
-                self.state = "select"
-                self.draw_select()
-        elif self.state == "lost":
-            if key in ("return", "space"):
-                self.start_level(self.current_level_index)
-            elif key == "escape":
-                self.state = "select"
-                self.draw_select()
-        elif self.state == "won":
-            if key in ("return", "space"):
-                self.start_level(self.current_level_index + 1)
-            elif key == "escape":
-                self.state = "select"
-                self.draw_select()
-        elif self.state == "complete":
-            if key in ("return", "space", "escape"):
-                self.state = "select"
-                self.draw_select()
+            if key in ("escape", "p"):
+                self.pause_game()
+        elif self.state == "paused":
+            self.handle_pause_key(key)
+        elif self.state in ("lost", "won", "complete"):
+            self.handle_result_key(key)
 
     def on_key_release(self, event):
         key = event.keysym.lower()
@@ -595,21 +694,48 @@ class DevilishPlatformer:
         elif key in ("up", "w", "space"):
             self.keys["jump"] = False
 
-    def handle_select_key(self, key):
-        cols = self.select_cols
+    # menu screen keyboard
+    def handle_menu_key(self, key):
+        opts = self.menu_options()
+        if key in ("up", "w"):
+            self.menu_index = (self.menu_index - 1) % len(opts)
+        elif key in ("down", "s"):
+            self.menu_index = (self.menu_index + 1) % len(opts)
+        elif key in ("return", "space"):
+            opts[self.menu_index][1]()
+            return
+        elif key == "escape":
+            if self.show_controls:
+                self.show_controls = False
+        self.draw_menu()
+
+    def menu_options(self):
+        return [
+            ("PLAY", self.open_map),
+            ("HOW TO PLAY", self.toggle_controls),
+            ("QUIT", self.root.destroy),
+        ]
+
+    def toggle_controls(self):
+        self.show_controls = not self.show_controls
+        self.draw_menu()
+
+    def open_map(self):
+        self.state = "map"
+        self.select_index = min(self.unlocked - 1, len(self.LEVELS) - 1)
+        self.draw_map()
+
+    # map screen keyboard
+    def handle_map_key(self, key):
         n = len(self.LEVELS)
         if key in ("left", "a"):
-            if self.select_index % cols != 0:
-                self.select_index -= 1
+            self.select_index = max(0, self.select_index - 1)
         elif key in ("right", "d"):
-            if self.select_index % cols != cols - 1 and self.select_index + 1 < n:
-                self.select_index += 1
+            self.select_index = min(n - 1, self.select_index + 1)
         elif key in ("up", "w"):
-            if self.select_index - cols >= 0:
-                self.select_index -= cols
+            self.select_index = max(0, self.select_index - 1)
         elif key in ("down", "s"):
-            if self.select_index + cols < n:
-                self.select_index += cols
+            self.select_index = min(n - 1, self.select_index + 1)
         elif key in ("return", "space"):
             if self.select_index < self.unlocked:
                 self.start_level(self.select_index)
@@ -624,27 +750,112 @@ class DevilishPlatformer:
             self.state = "menu"
             self.draw_menu()
             return
-        self.draw_select()
+        self.draw_map()
+
+    # pause menu keyboard
+    def handle_pause_key(self, key):
+        opts = self.pause_options()
+        if key in ("up", "w"):
+            self.pause_index = (self.pause_index - 1) % len(opts)
+        elif key in ("down", "s"):
+            self.pause_index = (self.pause_index + 1) % len(opts)
+        elif key in ("return", "space"):
+            opts[self.pause_index][1]()
+            return
+        elif key in ("escape", "p"):
+            self.resume_game()
+            return
+        self.draw_frame()
+
+    def pause_options(self):
+        return [
+            ("RESUME", self.resume_game),
+            ("RESTART LEVEL", lambda: self.start_level(self.current_level_index)),
+            ("WORLD MAP", self.open_map),
+            ("MAIN MENU", self.go_menu),
+        ]
+
+    def go_menu(self):
+        self.state = "menu"
+        self.menu_index = 0
+        self.draw_menu()
+
+    # result overlay keyboard
+    def handle_result_key(self, key):
+        opts = self.result_options()
+        if key in ("up", "w", "left", "a"):
+            self.result_index = (self.result_index - 1) % len(opts)
+        elif key in ("down", "s", "right", "d"):
+            self.result_index = (self.result_index + 1) % len(opts)
+        elif key in ("return", "space"):
+            opts[self.result_index][1]()
+            return
+        elif key == "escape":
+            self.open_map()
+            return
+        self.draw_frame()
+
+    result_index = 0
+
+    def result_options(self):
+        if self.state == "lost":
+            return [("TRY AGAIN", lambda: self.start_level(self.current_level_index)),
+                    ("WORLD MAP", self.open_map)]
+        if self.state == "won":
+            return [("NEXT LEVEL", lambda: self.start_level(self.current_level_index + 1)),
+                    ("REPLAY", lambda: self.start_level(self.current_level_index)),
+                    ("WORLD MAP", self.open_map)]
+        return [("WORLD MAP", self.open_map), ("MAIN MENU", self.go_menu)]
+
+    def on_motion(self, event):
+        if self.state in ("menu", "map", "paused", "lost", "won", "complete"):
+            lx, ly = self.to_logical(event.x, event.y)
+            new_hover = None
+            for b in self.buttons:
+                if b["x0"] <= lx <= b["x1"] and b["y0"] <= ly <= b["y1"]:
+                    new_hover = b["key"]
+                    break
+            if new_hover != self.hover_key:
+                self.hover_key = new_hover
+                if new_hover is not None:
+                    if self.state == "menu":
+                        for i, (_, _) in enumerate(self.menu_options()):
+                            if f"menu{i}" == new_hover:
+                                self.menu_index = i
+                    elif self.state == "paused":
+                        for i, _ in enumerate(self.pause_options()):
+                            if f"pause{i}" == new_hover:
+                                self.pause_index = i
+                    elif self.state in ("lost", "won", "complete"):
+                        for i, _ in enumerate(self.result_options()):
+                            if f"res{i}" == new_hover:
+                                self.result_index = i
+                self.render_current()
 
     def on_click(self, event):
         lx, ly = self.to_logical(event.x, event.y)
-        if self.state == "select":
-            idx = self.hit_test_select(lx, ly)
-            if idx is not None and idx < self.unlocked:
-                self.select_index = idx
-                self.start_level(idx)
-        elif self.state == "menu":
-            self.state = "select"
-            self.draw_select()
-        elif self.state == "lost":
-            self.start_level(self.current_level_index)
-        elif self.state == "won":
-            self.start_level(self.current_level_index + 1)
-        elif self.state == "complete":
-            self.state = "select"
-            self.draw_select()
+        for b in self.buttons:
+            if b["x0"] <= lx <= b["x1"] and b["y0"] <= ly <= b["y1"]:
+                b["action"]()
+                return
+
+    def add_button(self, key, x0, y0, x1, y1, action):
+        self.buttons.append({"key": key, "x0": x0, "y0": y0, "x1": x1, "y1": y1, "action": action})
 
     # -- level lifecycle ----------------------------------------------
+
+    def pause_game(self):
+        self.state = "paused"
+        self.pause_index = 0
+        self.draw_frame()
+
+    def resume_game(self):
+        if self.state != "paused":
+            return
+        self.state = "playing"
+        self.jump_buffer = 0
+        self.draw_frame()
+        self.root.after(16, self.update)
 
     def start_level(self, idx):
         idx = max(0, min(idx, len(self.LEVELS) - 1))
@@ -660,12 +871,13 @@ class DevilishPlatformer:
         self.signs = data["signs"]
 
         start_x, start_y = data.get("start", (100, 200))
-        self.player_x, self.player_y = start_x, start_y
-        self.vx = 0
-        self.vy = 0
+        self.player_x, self.player_y = float(start_x), float(start_y)
+        self.vx = 0.0
+        self.vy = 0.0
         self.on_ground = False
         self.facing = 1
-        self.frame_count = 0
+        self.coyote = 0
+        self.jump_buffer = 0
 
         self.state = "playing"
         self.update_platforms_dynamics()
@@ -675,7 +887,6 @@ class DevilishPlatformer:
     def update(self):
         if self.state != "playing":
             return
-        self.update_input()
         self.apply_physics()
         if self.state == "playing":
             self.update_movers()
@@ -685,36 +896,55 @@ class DevilishPlatformer:
         if self.state == "playing":
             self.root.after(16, self.update)
 
-    def update_input(self):
-        if self.keys["left"] and not self.keys["right"]:
-            self.vx = -MOVE_SPEED
-        elif self.keys["right"] and not self.keys["left"]:
-            self.vx = MOVE_SPEED
-        else:
-            self.vx = 0
-
-        if self.vx > 0:
-            self.facing = 1
-        elif self.vx < 0:
-            self.facing = -1
-
-        if self.keys["jump"] and self.on_ground:
-            self.vy = -JUMP_FORCE
-            self.on_ground = False
-            self.keys["jump"] = False
-
     def apply_physics(self):
         self.update_platforms_dynamics()
 
+        # --- horizontal: accelerate toward target, friction otherwise ---
+        want = (1 if self.keys["right"] else 0) - (1 if self.keys["left"] else 0)
+        accel = GROUND_ACCEL if self.on_ground else AIR_ACCEL
+        friction = GROUND_FRICTION if self.on_ground else AIR_FRICTION
+        if want != 0:
+            target = want * MOVE_SPEED
+            if self.vx < target:
+                self.vx = min(self.vx + accel, target)
+            elif self.vx > target:
+                self.vx = max(self.vx - accel, target)
+            self.facing = want
+        else:
+            if self.vx > 0:
+                self.vx = max(0.0, self.vx - friction)
+            elif self.vx < 0:
+                self.vx = min(0.0, self.vx + friction)
+
+        # --- jump: coyote time + input buffering + variable height ---
+        if self.jump_buffer > 0:
+            self.jump_buffer -= 1
+        if self.coyote > 0:
+            self.coyote -= 1
+        if self.jump_buffer > 0 and (self.on_ground or self.coyote > 0):
+            self.vy = -JUMP_FORCE
+            self.on_ground = False
+            self.coyote = 0
+            self.jump_buffer = 0
+        # short hop: cut upward velocity when jump released mid-rise
+        if not self.keys["jump"] and self.vy < 0:
+            self.vy *= JUMP_CUT
+
         self.vy += GRAVITY
+        if self.vy > MAX_FALL:
+            self.vy = MAX_FALL
+
         self.player_x += self.vx
         self.player_y += self.vy
 
         if self.player_x < 0:
             self.player_x = 0
+            self.vx = 0
         if self.player_x + PLAYER_W > WIDTH:
             self.player_x = WIDTH - PLAYER_W
+            self.vx = 0
 
+        was_on_ground = self.on_ground
         self.on_ground = False
         for platform in self.platforms:
             if not platform.get("_solid", True):
@@ -734,13 +964,18 @@ class DevilishPlatformer:
                     platform["state"] = "landed"
                 break
 
+        # refresh coyote grace the moment we leave the ground
+        if was_on_ground and not self.on_ground:
+            self.coyote = COYOTE_FRAMES
+        elif self.on_ground:
+            self.coyote = COYOTE_FRAMES
+
         self.update_crumble_timers()
 
         if self.player_y > HEIGHT + 120:
             self.lose("You fell into the void.")
 
     def update_platforms_dynamics(self):
-        self.frame_count += 1
         for p in self.platforms:
             if p["type"] == "blink":
                 phase = (self.frame_count + p.get("offset", 0)) % p["period"]
@@ -810,152 +1045,219 @@ class DevilishPlatformer:
     def lose(self, reason="You got caught by the trap."):
         self.deaths += 1
         self.state = "lost"
+        self.result_index = 0
         self.lose_reason = reason
         self.draw_frame()
 
     def win(self):
-        self.score += 100
         if self.current_level_index + 1 >= self.unlocked:
             self.unlocked = min(len(self.LEVELS), self.current_level_index + 2)
             save_progress(self.unlocked)
 
+        self.result_index = 0
         if self.current_level_index >= len(self.LEVELS) - 1:
             self.state = "complete"
         else:
             self.state = "won"
         self.draw_frame()
 
-    # -- level select geometry -----------------------------------------
+    # -- world-map geometry --------------------------------------------
 
-    def select_boxes(self):
+    def _build_map_nodes(self):
         n = len(self.LEVELS)
-        cols = self.select_cols
-        box_w, box_h = 420, 260
-        gap_x, gap_y = 60, 60
-        total_w = cols * box_w + (cols - 1) * gap_x
-        start_x = (WIDTH - total_w) // 2
-        start_y = 260
-        boxes = []
+        left, right = 320, WIDTH - 320
+        mid_y = 620
+        amp = 150
+        nodes = []
         for i in range(n):
-            row, col = divmod(i, cols)
-            x0 = start_x + col * (box_w + gap_x)
-            y0 = start_y + row * (box_h + gap_y)
-            boxes.append((i, x0, y0, x0 + box_w, y0 + box_h))
-        return boxes
+            t = i / max(1, n - 1)
+            x = left + (right - left) * t
+            y = mid_y + amp * math.sin(t * math.pi * 1.6)
+            nodes.append((x, y))
+        return nodes
 
-    def hit_test_select(self, x, y):
-        for i, x0, y0, x1, y1 in self.select_boxes():
-            if x0 <= x <= x1 and y0 <= y <= y1:
+    def hit_test_node(self, lx, ly):
+        for i, (nx, ny) in enumerate(self.map_nodes):
+            if (lx - nx) ** 2 + (ly - ny) ** 2 <= 66 ** 2:
                 return i
         return None
 
-    # -- drawing: menu / select -----------------------------------------
-
-    def draw_keycap(self, x, y, w, h, label):
-        self.rrect(x, y, x + w, y + h, r=10, fill=SURFACE_ALT, outline=BORDER, width=2)
-        self.text(x + w / 2, y + h / 2, text=label, fill=TEXT_PRIMARY, font=("Segoe UI", 17, "bold"))
-
-    def draw_badge(self, cx, cy, label, color):
-        w = len(label) * 11 + 34
-        self.pill(cx - w / 2, cy - 19, cx + w / 2, cy + 19, fill=color, outline="")
-        self.text(cx, cy, text=label, fill=BADGE_TEXT, font=("Segoe UI", 13, "bold"))
-
-    def draw_lock_icon(self, cx, cy, size):
-        shackle_r = size * 0.5
-        self.oval(cx - shackle_r, cy - shackle_r * 1.5, cx + shackle_r, cy + shackle_r * 0.5,
-                   outline=TEXT_DIM, width=4)
-        body_w, body_h = size * 1.3, size * 0.95
-        bx0, by0, bx1, by1 = cx - body_w / 2, cy, cx + body_w / 2, cy + body_h
-        self.rrect(bx0, by0, bx1, by1, r=6, fill=TEXT_DIM, outline="")
-        self.oval(cx - 4, cy + body_h * 0.3, cx + 4, cy + body_h * 0.3 + 8, fill=SURFACE, outline="")
+    # -- drawing: menu --------------------------------------------------
 
     def draw_menu(self):
         self.update_transform()
         self.canvas.delete("all")
+        self._img_refs = []
+        self.buttons = []
         self.draw_bg(MENU_BG_TOP, MENU_BG_BOTTOM, "menu")
-        self.draw_particles()
+        self.draw_stars()
 
-        self.text(WIDTH // 2, 200, text="LEVEL DEVIL-ISH", fill=TEXT_PRIMARY, font=("Segoe UI", 66, "bold"))
-        self.rrect(WIDTH // 2 - 150, 246, WIDTH // 2 + 150, 254, r=4, fill=ACCENT, outline="")
-        self.text(WIDTH // 2, 296, text="A cruel little platformer full of spikes, traps, and lies.",
-                  fill=TEXT_MUTED, font=("Segoe UI", 20))
+        # animated hero mascot idling by the title
+        bob = math.sin(self.frame_count * 0.08) * 6
+        self.blit("player_idle_0" if (self.frame_count // 20) % 6 else "player_idle_1",
+                  WIDTH // 2 - 470, 250 + bob, 150)
 
-        card_x0, card_y0, card_x1, card_y1 = WIDTH // 2 - 420, 360, WIDTH // 2 + 420, 570
+        self.text(WIDTH // 2, 200, text="LEVEL DEVIL-ISH", fill=TEXT_PRIMARY, font=(FONT, 72, "bold"))
+        self.rrect(WIDTH // 2 - 160, 250, WIDTH // 2 + 160, 258, r=4, fill=ACCENT, outline="")
+        self.text(WIDTH // 2, 300, text="A cruel little platformer full of spikes, traps, and lies.",
+                  fill=TEXT_MUTED, font=(FONT, 22))
+
+        if self.show_controls:
+            self.draw_controls_card()
+        else:
+            self.draw_menu_buttons()
+
+        self.text(WIDTH // 2, HEIGHT - 90, text="Tip: nothing here is as safe as it looks.",
+                  fill=DANGER, font=(FONT, 18, "italic"))
+        self.text(WIDTH // 2, HEIGHT - 55, text=f"{self.unlocked}/{len(self.LEVELS)} levels unlocked",
+                  fill=TEXT_DIM, font=(FONT, 16))
+
+    def draw_menu_buttons(self):
+        opts = self.menu_options()
+        bw, bh, gap = 460, 82, 26
+        top = 400
+        for i, (label, _) in enumerate(opts):
+            x0 = WIDTH // 2 - bw / 2
+            y0 = top + i * (bh + gap)
+            self._menu_button(f"menu{i}", label, x0, y0, x0 + bw, y0 + bh,
+                              i == self.menu_index, opts[i][1],
+                              primary=(i == 0))
+
+    def _menu_button(self, key, label, x0, y0, x1, y1, active, action, primary=False):
+        self.add_button(key, x0, y0, x1, y1, action)
+        self.pill(x0 + 5, y0 + 7, x1 + 5, y1 + 7, fill=SHADOW_COLOR, outline="")
+        if active:
+            fill = ACCENT_STRONG if primary else SURFACE_LIGHT
+            outline = ACCENT
+            tcol = "#ffffff"
+            width = 3
+        else:
+            fill = SURFACE if primary else SURFACE_ALT
+            outline = BORDER
+            tcol = TEXT_MUTED if not primary else TEXT_PRIMARY
+            width = 2
+        self.pill(x0, y0, x1, y1, fill=fill, outline=outline, width=width)
+        if active:
+            self.text(x0 + 44, (y0 + y1) / 2, text="▶", fill=ACCENT, font=(FONT, 22, "bold"))
+        self.text((x0 + x1) / 2, (y0 + y1) / 2, text=label, fill=tcol, font=(FONT, 26, "bold"))
+
+    def draw_controls_card(self):
+        card_x0, card_y0, card_x1, card_y1 = WIDTH // 2 - 430, 380, WIDTH // 2 + 430, 720
         self.rrect(card_x0 + 8, card_y0 + 12, card_x1 + 8, card_y1 + 12, r=26, fill=SHADOW_COLOR, outline="")
         self.rrect(card_x0, card_y0, card_x1, card_y1, r=26, fill=SURFACE, outline=BORDER, width=2)
-        self.text(WIDTH // 2, card_y0 + 44, text="CONTROLS", fill=ACCENT, font=("Segoe UI", 22, "bold"))
+        self.text(WIDTH // 2, card_y0 + 46, text="HOW TO PLAY", fill=ACCENT, font=(FONT, 24, "bold"))
 
         def control_row(y, caps, label):
-            x = card_x0 + 70
+            x = card_x0 + 80
             for cap in caps:
-                w = 130 if len(cap) > 2 else 68
-                self.draw_keycap(x, y, w, 56, cap)
+                w = 140 if len(cap) > 2 else 72
+                self.rrect(x, y, x + w, y + 58, r=10, fill=SURFACE_ALT, outline=BORDER, width=2)
+                self.text(x + w / 2, y + 29, text=cap, fill=TEXT_PRIMARY, font=(FONT, 18, "bold"))
                 x += w + 14
-            self.text(x + 20, y + 28, text=label, fill=TEXT_MUTED, font=("Segoe UI", 18, "bold"), anchor="w")
+            self.text(x + 22, y + 29, text=label, fill=TEXT_MUTED, font=(FONT, 19, "bold"), anchor="w")
 
-        control_row(card_y0 + 95, ["A", "D"], "MOVE LEFT / RIGHT")
-        control_row(card_y0 + 175, ["W", "SPACE"], "JUMP")
+        control_row(card_y0 + 84, ["A", "D"], "MOVE LEFT / RIGHT")
+        control_row(card_y0 + 160, ["W", "SPACE"], "JUMP  (hold for higher)")
+        control_row(card_y0 + 236, ["ESC", "P"], "PAUSE")
 
-        btn_x0, btn_y0, btn_x1, btn_y1 = WIDTH // 2 - 230, 630, WIDTH // 2 + 230, 700
-        self.pill(btn_x0 + 6, btn_y0 + 8, btn_x1 + 6, btn_y1 + 8, fill=SHADOW_COLOR, outline="")
-        self.pill(btn_x0, btn_y0, btn_x1, btn_y1, fill=ACCENT_STRONG, outline=ACCENT, width=2)
-        self.text(WIDTH // 2, (btn_y0 + btn_y1) / 2, text="PRESS ENTER TO BEGIN",
-                  fill="#ffffff", font=("Segoe UI", 22, "bold"))
+        # back button
+        bw, bh = 300, 66
+        x0 = WIDTH // 2 - bw / 2
+        y0 = card_y1 + 24
+        self._menu_button("menuback", "BACK", x0, y0, x0 + bw, y0 + bh, True, self.toggle_controls, primary=True)
 
-        self.text(WIDTH // 2, 790, text="Tip: nothing here is as safe as it looks.",
-                  fill=DANGER, font=("Segoe UI", 18, "italic"))
-        self.text(WIDTH // 2, 840, text=f"{self.unlocked}/{len(self.LEVELS)} levels unlocked",
-                  fill=TEXT_DIM, font=("Segoe UI", 16))
+    # -- drawing: world map ---------------------------------------------
 
-    def draw_select(self):
+    def draw_map(self):
         self.update_transform()
         self.canvas.delete("all")
-        self.draw_bg(MENU_BG_TOP, MENU_BG_BOTTOM, "select")
-        self.draw_particles()
+        self._img_refs = []
+        self.buttons = []
+        self.draw_bg(MENU_BG_TOP, MENU_BG_BOTTOM, "map")
+        self.draw_stars()
 
-        self.text(WIDTH // 2, 100, text="SELECT A LEVEL", fill=TEXT_PRIMARY, font=("Segoe UI", 44, "bold"))
-        self.text(
-            WIDTH // 2, 150,
-            text="Arrow keys / click to choose   •   Enter to play   •   1-6 to jump   •   Esc for title",
-            fill=TEXT_MUTED, font=("Segoe UI", 16),
-        )
+        self.text(WIDTH // 2, 110, text="WORLD MAP", fill=TEXT_PRIMARY, font=(FONT, 48, "bold"))
+        self.text(WIDTH // 2, 165,
+                  text="Arrows / click to choose   •   Enter to play   •   1-6 jump to a level   •   Esc for title",
+                  fill=TEXT_MUTED, font=(FONT, 17))
 
-        for i, x0, y0, x1, y1 in self.select_boxes():
-            level = self.LEVELS[i]
-            unlocked = i < self.unlocked
-            completed = i < self.unlocked - 1
-            selected = i == self.select_index
+        # connecting path between nodes (dashed segments, lit up to progress)
+        for i in range(len(self.map_nodes) - 1):
+            x0, y0 = self.map_nodes[i]
+            x1, y1 = self.map_nodes[i + 1]
+            reached = (i + 1) < self.unlocked
+            col = ACCENT if reached else BORDER_SOFT
+            self.line([x0, y0, x1, y1], fill=col, width=6, dash=(3, 3))
 
-            self.rrect(x0 + 8, y0 + 12, x1 + 8, y1 + 12, r=22, fill=SHADOW_COLOR, outline="")
-            fill = SURFACE_ALT if unlocked else SURFACE
-            outline = ACCENT if selected else (BORDER if unlocked else BORDER_SOFT)
-            self.rrect(x0, y0, x1, y1, r=22, fill=fill, outline=outline, width=4 if selected else 2)
+        for i, (nx, ny) in enumerate(self.map_nodes):
+            self.draw_map_node(i, nx, ny)
 
-            cx = (x0 + x1) / 2
-            num_color = ACCENT if unlocked else TEXT_DIM
-            self.text(cx, y0 + 58, text=str(i + 1), fill=num_color, font=("Segoe UI", 42, "bold"))
+        # info panel for the selected level
+        self.draw_map_info()
 
-            if unlocked:
-                self.text(cx, y0 + 148, text=level["name"], fill=TEXT_PRIMARY, font=("Segoe UI", 20, "bold"))
-                if completed:
-                    self.draw_badge(cx, y0 + 202, "COMPLETE", SUCCESS)
-                else:
-                    self.draw_badge(cx, y0 + 202, "PLAY", ACCENT)
-            else:
-                self.draw_lock_icon(cx, y0 + 140, 26)
-                self.text(cx, y0 + 205, text="LOCKED", fill=TEXT_DIM, font=("Segoe UI", 15, "bold"))
-
-        bar_x0, bar_y0, bar_x1, bar_y1 = WIDTH // 2 - 300, HEIGHT - 96, WIDTH // 2 + 300, HEIGHT - 76
+        # progress bar
+        bar_x0, bar_y0, bar_x1, bar_y1 = WIDTH // 2 - 320, HEIGHT - 70, WIDTH // 2 + 320, HEIGHT - 50
         self.pill(bar_x0, bar_y0, bar_x1, bar_y1, fill=SURFACE_ALT, outline=BORDER, width=2)
         total = max(1, len(self.LEVELS) - 1)
         frac = (self.unlocked - 1) / total
         if frac > 0:
             fill_x1 = bar_x0 + (bar_x1 - bar_x0) * min(1.0, frac)
             self.pill(bar_x0, bar_y0, max(bar_x0 + (bar_y1 - bar_y0), fill_x1), bar_y1, fill=ACCENT_STRONG, outline="")
+        self.text(WIDTH // 2, HEIGHT - 26,
+                  text=f"{self.unlocked - 1}/{len(self.LEVELS)} cleared   •   {self.deaths} total deaths",
+                  fill=TEXT_DIM, font=(FONT, 15))
 
-        self.text(WIDTH // 2, HEIGHT - 40,
-                  text=f"Progress: {self.unlocked - 1}/{len(self.LEVELS)} cleared   •   {self.deaths} total deaths",
-                  fill=TEXT_DIM, font=("Segoe UI", 15))
+    def draw_map_node(self, i, nx, ny):
+        unlocked = i < self.unlocked
+        completed = i < self.unlocked - 1
+        selected = i == self.select_index
+        self.add_button(f"node{i}", nx - 60, ny - 60, nx + 60, ny + 60,
+                        (lambda idx=i: self.start_level(idx)) if unlocked else (lambda: None))
+
+        r = 54
+        if selected:
+            pulse = 6 + 4 * math.sin(self.frame_count * 0.12)
+            self.oval(nx - r - pulse, ny - r - pulse, nx + r + pulse, ny + r + pulse,
+                      outline=ACCENT, width=4, fill="")
+
+        # base disc
+        self.oval(nx - r + 4, ny - r + 8, nx + r + 4, ny + r + 8, fill=SHADOW_COLOR, outline="")
+        fill = SURFACE_ALT if unlocked else SURFACE
+        outline = ACCENT if selected else (BORDER if unlocked else BORDER_SOFT)
+        self.oval(nx - r, ny - r, nx + r, ny + r, fill=fill, outline=outline, width=4 if selected else 3)
+
+        if not unlocked:
+            self.blit("lock", nx, ny - 4, 42)
+        else:
+            self.text(nx, ny - 6, text=str(i + 1), fill=ACCENT if not completed else SUCCESS,
+                      font=(FONT, 40, "bold"))
+            if completed:
+                self.blit("flag", nx + 34, ny - 34, 34)
+
+    def draw_map_info(self):
+        i = self.select_index
+        level = self.LEVELS[i]
+        unlocked = i < self.unlocked
+        completed = i < self.unlocked - 1
+        px0, py0, px1, py1 = WIDTH // 2 - 380, 850, WIDTH // 2 + 380, 990
+        self.rrect(px0 + 8, py0 + 10, px1 + 8, py1 + 10, r=22, fill=SHADOW_COLOR, outline="")
+        self.rrect(px0, py0, px1, py1, r=22, fill=SURFACE, outline=BORDER, width=2)
+        self.text(px0 + 40, py0 + 46, text=f"LEVEL {i + 1}", fill=ACCENT, font=(FONT, 20, "bold"), anchor="w")
+        self.text(px0 + 40, py0 + 90, text=level["name"], fill=TEXT_PRIMARY, font=(FONT, 30, "bold"), anchor="w")
+
+        status = "LOCKED" if not unlocked else ("COMPLETE" if completed else "READY")
+        scol = TEXT_DIM if not unlocked else (SUCCESS if completed else WARNING)
+        self.text(px1 - 40, py0 + 46, text=status, fill=scol, font=(FONT, 20, "bold"), anchor="e")
+
+        if unlocked:
+            bw, bh = 300, 60
+            bx0 = px1 - 40 - bw
+            by0 = py1 - 40 - bh
+            self._menu_button(f"play{i}", "▶  PLAY", bx0, by0, bx0 + bw, by0 + bh, True,
+                              lambda: self.start_level(i), primary=True)
+        else:
+            self.text(px1 - 40, py1 - 50, text="Clear the level before to unlock",
+                      fill=TEXT_DIM, font=(FONT, 16, "italic"), anchor="e")
 
     # -- drawing: gameplay world ------------------------------------------
 
@@ -963,64 +1265,73 @@ class DevilishPlatformer:
         if p["type"] == "crumble":
             if p["state"] == "gone":
                 return
-            base = SURFACE_ALT if p["state"] == "idle" else "#7c4a12"
-            edge = BORDER if p["state"] == "idle" else WARNING
+            base = CRUMBLE_FILL if p["state"] == "idle" else "#8a5417"
+            top = CRUMBLE_TOP
+            sh = CRUMBLE_SH
         elif p["type"] == "blink":
             if not p.get("_solid", True):
-                self.rrect(p["x"], p["y"], p["x"] + p["w"], p["y"] + p["h"], r=10,
-                           fill="", outline=BORDER_SOFT, dash=(6, 4), width=2)
+                self.rect(p["x"], p["y"], p["x"] + p["w"], p["y"] + p["h"],
+                          fill="", outline=BORDER_SOFT, dash=(6, 4), width=2)
                 return
-            base, edge = SURFACE_ALT, ACCENT
+            base, top, sh = BRICK_FILL, "#7f8dff", BRICK_SH
         else:
-            base, edge = SURFACE_ALT, BORDER
+            base, top, sh = BRICK_FILL, BRICK_TOP, BRICK_SH
 
-        self.rrect(p["x"], p["y"], p["x"] + p["w"], p["y"] + p["h"], r=10, fill=base, outline=edge, width=3)
-        hi_h = min(p["h"] * 0.3, 10)
-        self.rrect(p["x"] + 6, p["y"] + 4, p["x"] + p["w"] - 6, p["y"] + 4 + hi_h, r=5,
-                   fill=SURFACE_LIGHT, outline="")
+        x0, y0, x1, y1 = p["x"], p["y"], p["x"] + p["w"], p["y"] + p["h"]
+        self.rect(x0, y0, x1, y1, fill=base, outline="")
+        # blocky bevel
+        self.rect(x0, y0, x1, y0 + max(4, p["h"] * 0.22), fill=top, outline="")
+        self.rect(x0, y1 - max(3, p["h"] * 0.16), x1, y1, fill=sh, outline="")
+        # mortar seams
+        seam = BRICK_MORTAR if p["type"] != "crumble" else CRUMBLE_SH
+        step = max(60, p["w"] / 6)
+        gx = x0 + step
+        while gx < x1 - 4:
+            self.line([gx, y0 + p["h"] * 0.22, gx, y1], fill=seam, width=2)
+            gx += step
+        self.rect(x0, y0, x1, y1, fill="", outline=OUTLINE_DARK, width=2)
 
-    def draw_spike(self, x, y, w, h):
-        self.poly([x, y + h, x + w / 2, y, x + w, y + h], fill=DANGER, outline=DANGER_DARK, width=2)
-        self.poly([x + w * 0.28, y + h, x + w / 2, y + h * 0.25, x + w * 0.72, y + h], fill="#fca5a5", outline="")
+    def draw_hud(self):
+        level = self.LEVELS[self.current_level_index]
+
+        self.pill(30, 26, 250, 78, fill=SURFACE, outline=BORDER, width=2)
+        self.oval(50, 40, 76, 66, fill=DANGER, outline="")
+        self.text(63, 53, text="✖", fill=BADGE_TEXT, font=(FONT, 14, "bold"))
+        self.text(150, 53, text=f"Deaths {self.deaths}", fill=TEXT_PRIMARY, font=(FONT, 18, "bold"))
+
+        name_w = len(level["name"]) * 14 + 250
+        cx0 = WIDTH / 2 - name_w / 2
+        self.pill(cx0, 26, cx0 + name_w, 78, fill=SURFACE, outline=BORDER, width=2)
+        self.text(WIDTH / 2, 53, text=f"LEVEL {self.current_level_index + 1} — {level['name']}",
+                  fill=TEXT_PRIMARY, font=(FONT, 18, "bold"))
+
+        self.pill(WIDTH - 260, 26, WIDTH - 30, 78, fill=SURFACE, outline=BORDER, width=2)
+        self.text(WIDTH - 145, 53, text="ESC — Pause", fill=TEXT_MUTED, font=(FONT, 16))
+
+    def draw_spike(self, hz):
+        self.blit("spike", hz["x"] + hz["w"] / 2, hz["y"] + hz["h"], hz["h"] * 1.15, anchor="s")
 
     def draw_saw(self, m):
-        cx = m["x"] + m["w"] / 2
-        cy = m["y"] + m["h"] / 2
-        r = max(m["w"], m["h"]) / 2
-        teeth = 8
-        angle0 = (self.frame_count * 6) % 360
-        pts = []
-        for i in range(teeth * 2):
-            ang = math.radians(angle0 + i * (360 / (teeth * 2)))
-            rr = r if i % 2 == 0 else r * 0.62
-            pts += [cx + math.cos(ang) * rr, cy + math.sin(ang) * rr]
-        self.poly(pts, fill="#94a3b8", outline="#e2e8f0", width=2)
-        self.oval(cx - r * 0.4, cy - r * 0.4, cx + r * 0.4, cy + r * 0.4, fill="#475569", outline="#cbd5e1", width=2)
-        self.oval(cx - r * 0.12, cy - r * 0.12, cx + r * 0.12, cy + r * 0.12, fill="#1e293b", outline="")
+        frame = (self.frame_count // 3) % 4
+        size = max(m["w"], m["h"]) * 1.4
+        self.blit(f"saw_{frame}", m["x"] + m["w"] / 2, m["y"] + m["h"] / 2, size)
 
     def draw_dart(self, d):
-        x, y, w, h = d["arrow_x"], d["y"], d["w"], d["h"]
-        cy = y + h / 2
-        if d["dir"] >= 0:
-            shaft = [x, y + h * 0.3, x + w * 0.7, y + h * 0.3, x + w * 0.7, y + h * 0.7, x, y + h * 0.7]
-            head = [x + w * 0.7, y, x + w, cy, x + w * 0.7, y + h]
-        else:
-            shaft = [x + w * 0.3, y + h * 0.3, x + w, y + h * 0.3, x + w, y + h * 0.7, x + w * 0.3, y + h * 0.7]
-            head = [x + w * 0.3, y, x, cy, x + w * 0.3, y + h]
-        self.poly(shaft, fill=WARNING, outline="")
-        self.poly(head, fill=WARNING, outline="#78350f", width=2)
+        flip = d["dir"] < 0
+        cy = d["y"] + d["h"] / 2
+        self.blit("dart", d["arrow_x"] + d["w"] / 2, cy, d["h"] * 1.4, flip=flip)
 
-    def draw_goal(self, g):
+    def draw_goal(self, g, fake=False):
         cx = g["x"] + g["w"] / 2
         cy = g["y"] + g["h"] / 2
-        pulse = 1 + 0.06 * math.sin(self.frame_count * 0.12)
-        rw, rh = g["w"] / 2 * pulse, g["h"] / 2 * pulse
-        self.oval(cx - rw - 10, cy - rh - 10, cx + rw + 10, cy + rh + 10, fill=SURFACE_LIGHT, outline="")
-        self.oval(cx - rw, cy - rh, cx + rw, cy + rh, fill=SUCCESS, outline="#a7f3d0", width=3)
-        self.oval(cx - rw * 0.55, cy - rh * 0.55, cx + rw * 0.55, cy + rh * 0.55, fill="#d1fae5", outline="")
-        cs = min(g["w"], g["h"]) * 0.18
-        self.poly([cx - cs, cy + cs * 0.5, cx, cy - cs * 0.6, cx + cs, cy + cs * 0.5, cx, cy + cs * 0.05],
-                  fill=SURFACE, outline="")
+        if fake:
+            self.blit("portal_fake", cx, cy, g["h"] * 1.4)
+        else:
+            frame = (self.frame_count // 6) % 4
+            glow = 0.5 + 0.5 * math.sin(self.frame_count * 0.14)
+            gr = g["w"] * (0.85 + 0.12 * glow)
+            self.oval(cx - gr, cy - gr, cx + gr, cy + gr, fill="", outline=SUCCESS, width=2)
+            self.blit(f"portal_{frame}", cx, cy, g["h"] * 1.5)
 
     def draw_sign(self, s):
         w = len(s["text"]) * 11 + 40
@@ -1028,111 +1339,34 @@ class DevilishPlatformer:
         x0, y0, x1, y1 = s["x"] - w / 2, s["y"] - h, s["x"] + w / 2, s["y"]
         self.poly([s["x"] - 10, y1, s["x"] + 10, y1, s["x"], y1 + 16], fill=SURFACE, outline=WARNING, width=2)
         self.rrect(x0, y0, x1, y1, r=12, fill=SURFACE, outline=WARNING, width=2)
-        self.text(s["x"], (y0 + y1) / 2, text=s["text"], fill=WARNING, font=("Segoe UI", 14, "bold"))
+        self.text(s["x"], (y0 + y1) / 2, text=s["text"], fill=WARNING, font=(FONT, 14, "bold"))
 
     def draw_player(self):
         x, y = self.player_x, self.player_y
-        w, h = PLAYER_W, PLAYER_H
-        cx = x + w / 2
-        airborne = not self.on_ground
-        moving = abs(self.vx) > 0.2
-        facing = self.facing
+        cx = x + PLAYER_W / 2
+        flip = self.facing < 0
 
-        skin, limb, outline, dark = PLAYER_SKIN, PLAYER_SKIN_DARK, PLAYER_OUTLINE, "#1a1206"
-
+        # shadow on the ground
         if self.on_ground:
-            shadow_w = w * 1.3
-            self.oval(cx - shadow_w / 2, y + h - 6, cx + shadow_w / 2, y + h + 14, fill=SHADOW_COLOR, outline="")
+            sw = PLAYER_W * 1.15
+            self.oval(cx - sw / 2, y + PLAYER_H - 8, cx + sw / 2, y + PLAYER_H + 10,
+                      fill=SHADOW_COLOR, outline="")
 
-        head = w * 0.75
-        hx0, hy0 = x + (w - head) / 2, y
-        hx1, hy1 = hx0 + head, hy0 + head
-        self.rrect(hx0, hy0, hx1, hy1, r=head * 0.28, fill=skin, outline=outline, width=2)
-
-        eye = max(3, head * 0.16)
-        ey = hy0 + head * 0.4
-        ex = hx0 + head * (0.58 if facing >= 0 else 0.26)
-        self.rect(ex, ey, ex + eye, ey + eye, fill=dark, outline="")
-
-        hip_y = y + h * 0.6
-        limb_w = max(4, w * 0.18)
-        self.line([cx, hy1, cx, hip_y], fill=limb, width=limb_w)
-        self.oval(cx - limb_w * 0.6, hy1 - limb_w * 0.6, cx + limb_w * 0.6, hy1 + limb_w * 0.6, fill=limb, outline="")
-
-        shoulder_y = hy1 + (hip_y - hy1) * 0.15
-        arm_reach = w * 0.9
-        arm_drop = h * 0.22
-        arm_width = max(3, w * 0.14)
-        if airborne:
-            arm_l = (cx - arm_reach * 0.5, shoulder_y - arm_drop * 0.6)
-            arm_r = (cx + arm_reach * 0.5, shoulder_y - arm_drop * 0.6)
+        # choose animation frame from motion state
+        if not self.on_ground:
+            frame = "player_jump" if self.vy < 0 else "player_fall"
+        elif abs(self.vx) > 0.6:
+            frame = f"player_run_{(self.frame_count // 5) % 4}"
         else:
-            swing = (w * 0.5) if moving and (self.frame_count // 6) % 2 == 0 else (-(w * 0.5) if moving else 0)
-            arm_l = (cx - arm_reach * 0.35 + swing * 0.3, shoulder_y + arm_drop)
-            arm_r = (cx + arm_reach * 0.35 - swing * 0.3, shoulder_y + arm_drop)
-        self.line([cx, shoulder_y, arm_l[0], arm_l[1]], fill=limb, width=arm_width)
-        self.line([cx, shoulder_y, arm_r[0], arm_r[1]], fill=limb, width=arm_width)
-        for hxp, hyp in (arm_l, arm_r):
-            self.oval(hxp - arm_width * 0.5, hyp - arm_width * 0.5, hxp + arm_width * 0.5, hyp + arm_width * 0.5,
-                      fill=outline, outline="")
+            frame = "player_idle_1" if (self.frame_count // 10) % 12 == 0 else "player_idle_0"
 
-        foot_y = y + h
-        leg_width = max(4, w * 0.16)
-        if airborne:
-            leg_l = (cx - w * 0.4, hip_y + (foot_y - hip_y) * 0.55)
-            leg_r = (cx + w * 0.4, hip_y + (foot_y - hip_y) * 0.55)
-        else:
-            stride = w * 0.55 if moving else w * 0.18
-            phase = (self.frame_count // 6) % 2
-            leg_l = (cx - stride, foot_y) if phase == 0 else (cx - stride * 0.3, foot_y)
-            leg_r = (cx + stride * 0.3, foot_y) if phase == 0 else (cx + stride, foot_y)
-        self.line([cx, hip_y, leg_l[0], leg_l[1]], fill=limb, width=leg_width)
-        self.line([cx, hip_y, leg_r[0], leg_r[1]], fill=limb, width=leg_width)
-        self.oval(cx - limb_w * 0.6, hip_y - limb_w * 0.6, cx + limb_w * 0.6, hip_y + limb_w * 0.6,
-                  fill=limb, outline="")
-
-    def draw_hud(self):
-        level = self.LEVELS[self.current_level_index]
-
-        self.pill(30, 26, 240, 74, fill=SURFACE, outline=BORDER, width=2)
-        self.oval(50, 38, 74, 62, fill=DANGER, outline="")
-        self.text(62, 50, text="!", fill=BADGE_TEXT, font=("Segoe UI", 15, "bold"))
-        self.text(145, 50, text=f"Deaths {self.deaths}", fill=TEXT_PRIMARY, font=("Segoe UI", 17, "bold"))
-
-        name_w = len(level["name"]) * 13 + 230
-        cx0 = WIDTH / 2 - name_w / 2
-        self.pill(cx0, 26, cx0 + name_w, 74, fill=SURFACE, outline=BORDER, width=2)
-        self.text(WIDTH / 2, 50, text=f"LEVEL {self.current_level_index + 1} — {level['name']}",
-                  fill=TEXT_PRIMARY, font=("Segoe UI", 17, "bold"))
-
-        self.pill(WIDTH - 270, 26, WIDTH - 30, 74, fill=SURFACE, outline=BORDER, width=2)
-        self.text(WIDTH - 150, 50, text="ESC — Level Select", fill=TEXT_MUTED, font=("Segoe UI", 15))
-
-    def draw_overlay(self):
-        specs = {
-            "lost": (self.lose_reason, "Press Enter to try again   •   Esc for level select", DANGER, "!"),
-            "won": ("LEVEL CLEARED", "Press Enter for the next level   •   Esc for level select", SUCCESS, "✓"),
-            "complete": ("YOU BEAT LEVEL DEVIL-ISH", f"Total deaths this session: {self.deaths}", ACCENT, "★"),
-        }
-        title, sub, color, glyph = specs[self.state]
-
-        w0, h0, w1, h1 = WIDTH / 2 - 380, HEIGHT / 2 - 220, WIDTH / 2 + 380, HEIGHT / 2 + 180
-        self.rrect(w0 + 10, h0 + 14, w1 + 10, h1 + 14, r=30, fill=SHADOW_COLOR, outline="")
-        self.rrect(w0, h0, w1, h1, r=30, fill=SURFACE, outline=color, width=3)
-
-        self.oval(WIDTH / 2 - 42, h0 + 36, WIDTH / 2 + 42, h0 + 120, fill=color, outline="")
-        self.text(WIDTH / 2, h0 + 78, text=glyph, fill=BADGE_TEXT, font=("Segoe UI", 34, "bold"))
-
-        self.text(WIDTH / 2, h0 + 170, text=title, fill=TEXT_PRIMARY, font=("Segoe UI", 28, "bold"))
-        self.text(WIDTH / 2, h0 + 218, text=sub, fill=TEXT_MUTED, font=("Segoe UI", 18))
-
-        if self.state == "complete":
-            self.text(WIDTH / 2, h0 + 260, text="Press Enter to return to Level Select",
-                      fill=color, font=("Segoe UI", 18, "bold"))
+        self.blit(frame, cx, y + PLAYER_H, PLAYER_H, anchor="s", flip=flip)
 
     def draw_frame(self):
         self.update_transform()
         self.canvas.delete("all")
+        self._img_refs = []
+        self.buttons = []
         self.draw_bg(PLAY_BG_TOP, PLAY_BG_BOTTOM, "play")
 
         for gx in range(0, WIDTH, 170):
@@ -1144,7 +1378,7 @@ class DevilishPlatformer:
             self.draw_platform(p)
 
         for hz in self.hazards:
-            self.draw_spike(hz["x"], hz["y"], hz["w"], hz["h"])
+            self.draw_spike(hz)
 
         for mv in self.movers:
             self.draw_saw(mv)
@@ -1154,7 +1388,7 @@ class DevilishPlatformer:
                 self.draw_dart(d)
 
         for fg in self.fake_goals:
-            self.draw_goal(fg)
+            self.draw_goal(fg, fake=True)
         self.draw_goal(self.goal)
 
         for s in self.signs:
@@ -1163,8 +1397,63 @@ class DevilishPlatformer:
         self.draw_player()
         self.draw_hud()
 
-        if self.state in ("lost", "won", "complete"):
+        if self.state == "paused":
+            self.draw_pause_overlay()
+        elif self.state in ("lost", "won", "complete"):
             self.draw_overlay()
+
+    # -- overlays -------------------------------------------------------
+
+    def _overlay_dim(self):
+        # translucent-ish darkening via a solid panel behind content
+        self.rect(0, 0, WIDTH, HEIGHT, fill="#05070f", outline="", stipple="gray50")
+
+    def draw_pause_overlay(self):
+        self._overlay_dim()
+        w0, h0, w1, h1 = WIDTH / 2 - 320, HEIGHT / 2 - 300, WIDTH / 2 + 320, HEIGHT / 2 + 300
+        self.rrect(w0 + 10, h0 + 14, w1 + 10, h1 + 14, r=28, fill=SHADOW_COLOR, outline="")
+        self.rrect(w0, h0, w1, h1, r=28, fill=SURFACE, outline=ACCENT, width=3)
+        self.text(WIDTH / 2, h0 + 70, text="PAUSED", fill=TEXT_PRIMARY, font=(FONT, 40, "bold"))
+        self.rrect(WIDTH / 2 - 70, h0 + 104, WIDTH / 2 + 70, h0 + 110, r=3, fill=ACCENT, outline="")
+
+        opts = self.pause_options()
+        bw, bh, gap = 480, 76, 22
+        top = h0 + 150
+        for i, (label, action) in enumerate(opts):
+            x0 = WIDTH / 2 - bw / 2
+            y0 = top + i * (bh + gap)
+            self._menu_button(f"pause{i}", label, x0, y0, x0 + bw, y0 + bh,
+                              i == self.pause_index, action, primary=(i == 0))
+
+    def draw_overlay(self):
+        self._overlay_dim()
+        specs = {
+            "lost": (self.lose_reason, DANGER, "✖"),
+            "won": ("LEVEL CLEARED", SUCCESS, "✓"),
+            "complete": ("YOU BEAT LEVEL DEVIL-ISH", ACCENT, "★"),
+        }
+        title, color, glyph = specs[self.state]
+
+        w0, h0, w1, h1 = WIDTH / 2 - 400, HEIGHT / 2 - 280, WIDTH / 2 + 400, HEIGHT / 2 + 280
+        self.rrect(w0 + 10, h0 + 14, w1 + 10, h1 + 14, r=30, fill=SHADOW_COLOR, outline="")
+        self.rrect(w0, h0, w1, h1, r=30, fill=SURFACE, outline=color, width=3)
+
+        self.oval(WIDTH / 2 - 46, h0 + 44, WIDTH / 2 + 46, h0 + 136, fill=color, outline="")
+        self.text(WIDTH / 2, h0 + 90, text=glyph, fill=BADGE_TEXT, font=(FONT, 40, "bold"))
+
+        self.text(WIDTH / 2, h0 + 186, text=title, fill=TEXT_PRIMARY, font=(FONT, 30, "bold"))
+        if self.state == "complete":
+            self.text(WIDTH / 2, h0 + 232, text=f"Total deaths this session: {self.deaths}",
+                      fill=TEXT_MUTED, font=(FONT, 20))
+
+        opts = self.result_options()
+        bw, bh, gap = 460, 74, 20
+        top = h0 + 290
+        for i, (label, action) in enumerate(opts):
+            x0 = WIDTH / 2 - bw / 2
+            y0 = top + i * (bh + gap)
+            self._menu_button(f"res{i}", label, x0, y0, x0 + bw, y0 + bh,
+                              i == self.result_index, action, primary=(i == 0))
 
 
 if __name__ == "__main__":
